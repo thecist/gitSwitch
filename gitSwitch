@@ -1,0 +1,312 @@
+#!/usr/bin/env python
+
+'''
+I don't want my program to be dependent on unimportant files
+No extra metadata will be stored in memory
+
+Once a folder has more than one id_blablabla, id_blablabla.pub pair files you give up on it
+You tell the user to do it themselves (this is to prevent storing the file to use and other metadata)
+Maybe write an article on it and then send the user to the link?
+
+
+
+Two configs
+One is git and the other is the default file
+
+Git configs are stored but deleting them does not destroy the system
+It just means that user have a blank config
+How do I know which file has the public and private?
+
+Maybe change the generate_ssh function to create_user where a name is also an option
+Store configs in the respective file
+Create a json that has a name, email pair that links a user to their file
+'''
+# Reduce the number of packages used
+import argparse, subprocess, os, shutil
+# Use a custom made hash algorithm to replace the timestamp later
+from datetime import datetime
+
+def get_folder_location(user):
+    home_dir = os.path.expanduser("~")
+    ssh_dir = os.path.join(home_dir, ".ssh")
+    
+    return os.path.join(ssh_dir, user)
+    
+def archive_files(file_arr, dir_location):
+    archive_folder = os.path.join(dir_location, 'archive')
+    os.makedirs(archive_folder, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for file_name in file_arr:
+        source_path = os.path.join(dir_location, file_name)
+        
+        base_name, extension = os.path.splitext(file_name)
+        new_file_name = f"{base_name}_{timestamp}{extension}"
+        destination_path = os.path.join(archive_folder, new_file_name)
+        
+        # Move file to archive folder
+        shutil.move(source_path, destination_path)
+        
+def find_identity_file(config_path, host_name="github.com"):
+    # Check if file exists already and create a file if it doesn't it's important
+    with open(config_path, 'r') as file:
+        found_host = False
+        identity_file = None
+        
+        for line in file:
+            stripped_line = line.strip()
+            
+            if stripped_line == f"Host {host_name}":
+                found_host = True
+            
+            if found_host and stripped_line.startswith("IdentityFile"):
+                identity_file = stripped_line.split(" ", 1)[1].strip()
+                break
+
+            if found_host and stripped_line.startswith("Host ") and stripped_line != f"Host {host_name}":
+                break
+
+    return identity_file
+    
+def replace_identity_file(config_path, new_identity_file, host_name="github.com"):
+    with open(config_path, 'r') as file:
+        lines = file.readlines()
+
+    found_host = False
+    replaced = False
+
+    for i, line in enumerate(lines):
+        stripped_line = line.strip()
+
+        # If in the correct Host section, look for IdentityFile
+        if found_host and stripped_line.startswith("IdentityFile"):
+            # Replace the existing IdentityFile path
+            lines[i] = f"\tIdentityFile {new_identity_file}\n"
+            replaced = True
+            break
+        
+        # If another Host section is found, insert the IdentityFile before it
+        if found_host and not replaced:
+            if stripped_line.startswith("Host ") or stripped_line == "":
+                lines.insert(i, f"\tIdentityFile {new_identity_file}\n")
+                replaced = True
+                break
+                
+        # Check for the Host line
+        if stripped_line == f"Host {host_name}":
+            found_host = True
+
+    # If no IdentityFile was found for the host, add it
+    if found_host and not replaced:
+        lines.append(f"\tIdentityFile {new_identity_file}\n")
+    elif not found_host:
+        # Add a new Host section if it wasn't found
+        lines.append(f"Host {host_name}\n")
+        lines.append(f"\tHostName {host_name}\n")
+        lines.append(f"\tUser git\n")
+        lines.append(f"\tIdentityFile {new_identity_file}\n")
+
+    # Write the modified lines back to the file
+    with open(config_path, 'w') as file:
+        file.writelines(lines)
+
+def validate_path(path):
+    if path is None:
+        return False
+    path = os.path.expanduser(path)
+    parent_folder = os.path.expanduser("~/.ssh/")
+    
+    if not path.startswith(parent_folder):
+        return False
+        
+    relative_path = path[len(parent_folder):]
+    
+    parts = relative_path.split(os.path.sep)
+    
+    if len(parts) != 2:
+        return False
+    
+    file_name, file_extension = os.path.splitext(parts[1])
+    if file_extension:
+        return False
+        
+    return True
+
+
+def create_user(args):
+    email = args.email
+    
+    folder_location = get_folder_location(email)
+    config_location = os.path.join(folder_location, ".gitconfig")
+    # Check if user already exists
+    if os.path.exists(folder_location) and os.path.isdir(folder_location):
+        # List all files in the directory
+        files = os.listdir(folder_location)
+        
+        id_files = [f for f in files if os.path.isfile(os.path.join(folder_location, f)) and f.startswith("id_")]
+        if len(id_files) > 0 or os.path.exists(config_location):
+            # Offer to archive the files here
+            print(f"user-manager has detected an existing user with the same email provided: {email}\nPlease move or delete the folder at {folder_location} to proceed with the user creation")
+            return
+            
+    # Generate ssh
+    regenerate_ssh(args)
+    
+    # Create config file
+    with open(config_location, "w") as file:
+        file.write("[user]\n")
+        if args.name:
+            file.write(f"\tname = {args.name}\n")
+        file.write(f"\temail = {args.email}\n")
+        
+    # Create empty archive folder
+    archive_folder = os.path.join(folder_location, 'archive')
+    os.makedirs(archive_folder, exist_ok=True)
+    
+    # Check if ssh config exists and create one if it doesn't
+    home_dir = os.path.expanduser("~")
+    ssh_dir = os.path.join(home_dir, ".ssh")
+    ssh_config_location = os.path.join(ssh_dir, "config")
+    if not os.path.exists(ssh_config_location):
+        with open(ssh_config_location, "w") as file:
+            pass
+        switch_user(args)
+
+def regenerate_ssh(args):
+    key_type = args.key_type or "ed25519"
+    email = args.email
+    
+    folder_location = get_folder_location(email)
+    os.makedirs(folder_location, exist_ok=True)
+    
+    files = os.listdir(folder_location)
+    id_files = [f for f in files if os.path.isfile(os.path.join(folder_location, f)) and f.startswith("id_")]
+    if len(id_files) > 0:
+        # Conditionally render other/another and key(s)
+        print(id_files)
+        user_reply = ""
+        while True:
+            user_reply = input(f"user-manager has detected other private/public ssh keys\nProceeding will automatically move the files into an archive folder.\nWould you like to proceed? (y/n) ")
+            if user_reply == "n":
+                return
+            elif user_reply == "y":
+                archive_files(id_files, folder_location)
+                break
+            else:
+                print("\nPlease type 'y' to proceed and 'n' to halt the process")
+        
+    
+    file_location = os.path.join(folder_location, f"id_{key_type}")
+    passphrase = args.passphrase or ""
+    
+    command = [
+        "ssh-keygen",
+        "-t", key_type,
+        "-C", email,
+        "-f", file_location,
+        "-N", passphrase
+    ]
+    
+    subprocess.run(command, check=True)
+    
+def switch_user(args):
+    # This function checks if the user exists and if they have only one private file
+    # If they don't have only one you refer the user to your article about what to do
+    # If it does it copies the current config file in the git profile and keeps it in the same directory as the private file in the ssh config file
+    # After that it gets the private file from the user folder and replaces it in the ssh config file
+    # Lastly it updates the git config file with the one stored in the user folder or none if there isn't any
+    user = args.email
+    folder_location = get_folder_location(user)
+    if not os.path.exists(folder_location) or not os.path.isdir(folder_location):
+        # Add formatting to emphasize the word "list"
+        print("User does not exist.\nRun the list command to see available users or the create_user command to create a new user.")
+    files = os.listdir(folder_location)
+    id_files = [f for f in files if os.path.isfile(os.path.join(folder_location, f)) and f.startswith("id_")]
+    if len(id_files) == 0:
+        print("User does not exist.\nRun the list command to see available users or the create_user command to create a new user.")
+    private_file_list = list(filter(lambda file_name: len(os.path.splitext(file_name)[1]) == 0, id_files))
+    if len(private_file_list) != 1:
+        # Link the same article here for what to do when you have more than one or no private files
+        print("User needs to have only one private file to be switched to.\nDump the unused private/public files in an archive folder or read this artcle [link pending]")
+        return
+    
+    private_file = private_file_list[0]
+    
+    home_dir = os.path.expanduser("~")
+    git_config_source = os.path.join(home_dir, ".gitconfig")
+    ssh_dir = os.path.join(home_dir, ".ssh")
+    ssh_config_file = os.path.join(ssh_dir, "config")
+    identity_file = find_identity_file(ssh_config_file)
+    
+    if os.path.exists(git_config_source) and validate_path(identity_file):
+        path = os.path.expanduser(identity_file).split(os.path.sep)
+        previous_user = path[-2]
+        if previous_user == user:
+            print(f"You are already the user: {user}")
+            return
+        previous_user_folder = os.path.join(ssh_dir, previous_user)
+        os.makedirs(previous_user_folder, exist_ok=True)
+        previous_user_config_destination = os.path.join(previous_user_folder, ".gitconfig")
+        shutil.copy2(git_config_source, previous_user_config_destination)
+        
+        # Clear config file after move
+        with open(git_config_source, 'w'):
+            pass  # Opening in 'w' mode truncates the file
+    
+    replace_identity_file(ssh_config_file, os.path.join(folder_location, private_file))
+    
+    
+    # First off I want to copy not move a file in both cases
+    # Secondly I should find a way to make sure the parent is the ~/.ssh directory and it's only two steps after that, the first being the username and the second being the file without an extension
+    # Instead of splitting the identityfile
+    git_config_destination = os.path.join(folder_location, ".gitconfig")
+    if os.path.exists(git_config_destination):
+        shutil.copy2(git_config_destination, git_config_source)
+    
+# Keep one more command to list users
+# Maybe another to show the location of the folders(not everyone might know)
+
+def cool_function(args):
+    print(f"C value: {args.C}")
+    print(f"B value: {args.b}")
+    text = input("Say something cool: ")
+    print(text)
+
+def main():
+    parser = argparse.ArgumentParser(prog='cool_command')
+    
+    subparsers = parser.add_subparsers(title='subcommands', dest='subcommand')
+    
+    parser_cool_function = subparsers.add_parser("cool_function", help="Dummy function for testing")
+    parser_cool_function.add_argument('-C', type=str, required=True, help='The value for C')
+    parser_cool_function.add_argument('-b', type=str, required=True, help='The value for b')
+    parser_cool_function.set_defaults(func=cool_function)
+    
+    # Regenerate ssh functionality
+    parser_regenerate_ssh = subparsers.add_parser("regenerate_ssh", help="Creates ssh public and private keys for git/GitHub connection")
+    parser_regenerate_ssh.add_argument("-key_type", type=str, help="The key type for the algorithm")
+    parser_regenerate_ssh.add_argument("-email", type=str, required=True, help="User email connected to their git profile")
+    parser_regenerate_ssh.add_argument("-passphrase", type=str, help="The passphrase for extra security")
+    parser_regenerate_ssh.set_defaults(func=regenerate_ssh)
+    
+    # Create user functionality
+    parser_create_user = subparsers.add_parser("create_user", help="Creates a new folder to store git credentials")
+    parser_create_user.add_argument("-key_type", type=str, help="The key type for the algorithm")
+    parser_create_user.add_argument("-email", type=str, required=True, help="User email connected to their git profile")
+    parser_create_user.add_argument("-passphrase", type=str, help="The passphrase for extra security")
+    parser_create_user.add_argument("-name", type=str, help="Global username for the git account")
+    parser_create_user.set_defaults(func=create_user)
+    
+    parser_switch_user = subparsers.add_parser("switch", help="Switches between github accounts")
+    parser_switch_user.add_argument("email", type=str, help="User email connected to their git profile")
+    parser_switch_user.set_defaults(func=switch_user)
+    
+    args = parser.parse_args()
+    
+    if args.subcommand is None:
+        parser.print_help()
+    else:
+        args.func(args)
+
+if __name__ == "__main__":
+    main()
